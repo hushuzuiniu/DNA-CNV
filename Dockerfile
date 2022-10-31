@@ -93,7 +93,7 @@ RUN wget -c https://ssd.mathworks.cn/supportfiles/MCR_Runtime/R2013a/MCR_R2013a_
 
 # Annovar 2017-07-17
 WORKDIR $software/source
-RUN git clone https://github.com/yqyuhao/bioinfo.git && cd bioinfo && unzip annovar_2017-07-17.zip && cd annovar && cp *.pl $software/bin
+RUN git clone https://github.com/hushuzuiniu/bioinfo_file && cd bioinfo_file && unzip annovar_2017-07-17.zip && cd annovar && cp *.pl $software/bin
 
 # ABSOLUTE 1.0.6
 WORKDIR $software/source
