@@ -1,0 +1,273 @@
+#!/bin/bash
+set +x
+#init
+######################
+software=/yqyuhao
+Ncpu=$(lscpu|awk '/^CPU\(s\)/{print int($2)}')
+bin_dir=$software/bin
+target_dir=$software/target
+database_dir=$software/database
+annovar_dir=$database_dir/Annovar_hg19
+GATK_dir=$database_dir/GATK_hg19
+ref=$GATK_dir/ucsc.hg19.fasta
+PWD=`pwd`
+echo Analysis_Path=$PWD
+export PATH=$bin_dir:$PATH
+#####Programs Usage################
+function echo_usage()
+{
+cat<<END
+Usage:
+YHaoLab_DNApipeline -f Somatic_configure.csv -i /DATA/fastq_directory
+	Input:
+		-f Somatic_configure.csv    Somatic Configure File
+		-i /DATA/fastq_directory    a directory of fastq files.
+	
+	ConfigFile Format:
+	SampleName           Tumor_Name      Normal_Name     Target_Region
+        Tumor1_Somatic       Tumor1          Normal1         Target1.bed
+        Tumor2_Somatic       Tumor2          Normal2         Target2.bed
+        Tumor3_Somatic       Tumor3          Normal3         Target3.bed
+	
+	Help:
+		-t                          Produce a templete of configure.csv file.
+		-h                          Show this help.
+        
+	Please check Sample Number ( less than $Ncpu Samples )
+    
+	Analysis Programs Created by yqyuhao  v2022-01-21
+END
+echo -e "\nTarget list:"
+for i in $target_dir/*.bed;do echo -e "\t`basename $i`";done
+exit 1
+}
+# function Tumor_Essential_Analysis
+function Tumor_Essential_Analysis()
+{
+		i=$1
+		bed=$2
+		sample_dir=${i}
+		fq1=`ls $inputF/${i}*R1*.gz`
+		echo fastq1=$fq1 >.log/mail.txt 2>&1
+		fq2=`ls $inputF/${i}*R2*.gz`
+		echo fastq2=$fq2 >>.log/mail.txt 2>&1
+		if [ ! -e $fq1 ];then
+		echo "ERROR: Can not find file $inputF/${i}*R1*.gz"
+			exit
+		else
+			if [ ! -e $fq2 ];then
+				echo "ERROR: Can not find file $inputF/${i}*R2*.gz"
+				exit
+			fi
+		fi
+		mkdir -p Essential/$sample_dir
+		cp $fq1 Essential/$sample_dir/
+		cp $fq2 Essential/$sample_dir/
+		#rm -f $fq1 $fq2
+		fq11=`basename $fq1`
+		fq22=`basename $fq2`
+		# Tumor Essential Analysis
+		$bin_dir/fastp -i Essential/$sample_dir/$fq11 -I Essential/$sample_dir/$fq22 -o Essential/$sample_dir/${i}.paired.R1.fastq -O Essential/$sample_dir/${i}.paired.R2.fastq --thread $Ncpu --json Essential/$sample_dir/${i}.json --html Essential/$sample_dir/${i}.html
+		perl $bin_dir/fastq2stat.pl Essential/$sample_dir/${i}.paired.R1.fastq & \
+		perl $bin_dir/fastq2stat.pl Essential/$sample_dir/${i}.paired.R2.fastq & \
+		perl $bin_dir/fastq2stat.pl Essential/$sample_dir/$fq11 & \
+		perl $bin_dir/fastq2stat.pl Essential/$sample_dir/$fq22
+		rm Essential/$sample_dir/$fq22 Essential/$sample_dir/$fq11 Essential/$sample_dir/${fq11/.gz/} Essential/$sample_dir/${fq22/.gz/}
+		$bin_dir/bwa mem -t $Ncpu -M -R "@RG\tID:${i}\tSM:${i}\tPL:ILLUMINA" $ref Essential/$sample_dir/${i}.paired.R1.fastq Essential/$sample_dir/${i}.paired.R2.fastq | $bin_dir/samtools view -q 10 -F 4 -@ $Ncpu -hb - > Essential/$sample_dir/${i}.bam
+		rm Essential/$sample_dir/${i}.paired.R2.fastq Essential/$sample_dir/${i}.paired.R1.fastq
+		$bin_dir/gatk --java-options "-Xmx4g" SortSam -I Essential/$sample_dir/${i}.bam -O Essential/$sample_dir/${i}.sort.bam -SO coordinate && $bin_dir/samtools index Essential/$sample_dir/${i}.sort.bam
+		rm Essential/$sample_dir/${i}.bam
+		$bin_dir/gatk --java-options "-Xmx4g" MarkDuplicates --REMOVE_DUPLICATES FALSE -I Essential/$sample_dir/${i}.sort.bam -O Essential/$sample_dir/${i}.dup.bam -M Essential/$sample_dir/${i}.dedup.metrics
+		$bin_dir/samtools stats Essential/$sample_dir/${i}.dup.bam | grep ^SN | cut -f 2- >Essential/$sample_dir/${i}.dup.stat
+		rm -f Essential/$sample_dir/${i}.dup.ba*
+		$bin_dir/gatk --java-options "-Xmx4g" MarkDuplicates --REMOVE_DUPLICATES TRUE -I Essential/$sample_dir/${i}.sort.bam -O Essential/$sample_dir/${i}.unique.bam -M Essential/$sample_dir/${i}.unique.metrics
+		$bin_dir/samtools stats Essential/$sample_dir/${i}.sort.bam |grep ^SN | cut -f 2- >Essential/$sample_dir/${i}.stat
+		rm -f Essential/$sample_dir/${i}.sort.ba*
+		$bin_dir/samtools view -q 10 -@ $Ncpu -h Essential/$sample_dir/${i}.unique.bam -L $target_dir/${bed} >Essential/$sample_dir/${i}.ontarget.bam
+		$bin_dir/samtools stats Essential/$sample_dir/${i}.unique.bam | grep ^SN | cut -f 2- >Essential/$sample_dir/${i}.unique.stat
+		rm -f Essential/$sample_dir/${i}.unique.ba*
+		$bin_dir/gatk --java-options "-Xmx4g" AddOrReplaceReadGroups -I Essential/$sample_dir/${i}.ontarget.bam -O Essential/$sample_dir/${i}.addhead.bam -LB ${i} -PL Illumina -PU hg19 -SM ${i} >>.log/$sample_dir.Tumor_Essential_Analysis.log 2>&1
+		$bin_dir/samtools stats Essential/$sample_dir/${i}.ontarget.bam | grep ^SN | cut -f 2- >Essential/$sample_dir/${i}.ontarget.stat
+		rm -f Essential/$sample_dir/${i}.ontarget.ba*
+		$bin_dir/gatk --java-options "-Xmx4g" BaseRecalibrator -R $ref -I Essential/$sample_dir/${i}.addhead.bam --known-sites $GATK_dir/1000G_phase1.snps.high_confidence.hg19.vcf --known-sites $GATK_dir/Mills_and_1000G_gold_standard.indels.hg19.vcf -O Essential/$sample_dir/${i}.realign.table >>.log/$sample_dir.Tumor_Essential_Analysis.log 2>&1
+		$bin_dir/gatk --java-options "-Xmx4g" ApplyBQSR --bqsr-recal-file Essential/$sample_dir/${i}.realign.table -R $ref -I Essential/$sample_dir/${i}.addhead.bam -O Essential/$sample_dir/${i}.ready.bam >>.log/$sample_dir.Tumor_Essential_Analysis.log 2>&1
+		$bin_dir/gatk --java-options "-Xmx4g" CollectInsertSizeMetrics -I Essential/$sample_dir/${i}.ready.bam -O Essential/$sample_dir/${i}.insert_size_metrics.txt -H Essential/$sample_dir/${i}.insert_size_histogram.pdf
+		rm -f Essential/$sample_dir/${i}.addhead.ba*
+		$bin_dir/samtools depth -d 100000 -a -b $target_dir/${bed} Essential/$sample_dir/${i}.ready.bam >Essential/$sample_dir/${i}.${bed}.depth
+		less Essential/$sample_dir/${i}.${bed}.depth |cut -f3 |sort -n >Essential/$sample_dir/${i}.${bed}.all.depth
+		echo -ne "#SampleName\tPanelInformation\tAverage_depth\tOntarget_reads_ratio\tMapped_ratio\tUniformity\tOntarget_Coverage\tRaw_R1_Bases\tRaw_R1_Q30_Bases\tRaw_R1_Q30%\t" >Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Raw_R1_Q20_Bases\tRaw_R1_Q20%\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Raw_R2_Bases\tRaw_R2_Q30_Bases\tRaw_R2_Q30%\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Raw_R2_Q20_Bases\tRaw_R2_Q20%\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R1_Bases\tClean_R1_Q30_Bases\tClean_R1_Q30%\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R1_Q20_Bases\tClean_R1_Q20%\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R2_Bases\tClean_R2_Q30_Bases\tClean_R2_Q30%\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R2_Q20_Bases\tClean_R2_Q20%\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Average_read_length\tAverage_base_quality\tAverage_insert_size\tDuplication_rate(%)\tRaw_reads\tRaw_bases\tClean_reads\tClean_bases\tMapped_reads\tMapped_bases\tOntarget_reads\tOntarget_bases\tOntarget_bases_ratio\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "1X coverage rate(%)\t4X coverage rate(%)\t10X coverage rate(%)\t20X coverage rate(%)\t50X coverage rate(%)\t100X coverage rate(%)\t200X coverage rate(%)\t500X coverage rate(%)\tMedian_depth\tMode_insert_size\n" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		Raw_reads=`expr $(cat Essential/$sample_dir/${fq11/.gz/}.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}') + $(cat Essential/$sample_dir/${fq22/.gz/}.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}')`
+		Raw_bases=`expr $(cat Essential/$sample_dir/${fq11/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}') + $(cat Essential/$sample_dir/${fq22/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}')`
+		Clean_reads=`expr $(cat Essential/$sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}') + $(cat Essential/$sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}')`
+		Clean_bases=`expr $(cat Essential/$sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}') + $(cat Essential/$sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}')`
+		Unique_reads=`cat Essential/$sample_dir/${i}.unique.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]}'`
+		Unique_bases=`cat Essential/$sample_dir/${i}.unique.stat|awk '$0~/bases mapped:/{split($0,a,"\t");printf a[2]}'`
+		Duplicate_reads=`cat Essential/$sample_dir/${i}.dup.stat|awk '$0~/reads duplicated:/{split($0,a,"\t");printf a[2]}'`
+		Duplication_rate=`echo $Duplicate_reads $Clean_reads | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		Accurate_mapping_reads=`cat Essential/$sample_dir/${i}.stat|awk '$0~/reads mapped:/{split($0,a,":");gsub(/ /,"",a[2]);printf a[2]"\t"}'`  
+		Accurate_mapping_rate=`echo $Accurate_mapping_reads $Clean_reads | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		Target_overlaped_reads=`cat Essential/$sample_dir/${i}.ontarget.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]}'`
+		Reads_capture_rate=`echo $Target_overlaped_reads $Unique_reads | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		Target_effective_bases=`awk '{sum += $3};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.depth`
+		Bases_capture_rate=`echo $Target_effective_bases $Unique_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_bases=`cat Essential/$sample_dir/${i}.${bed}.all.depth|wc -l`
+		coverage_1x=`awk '$1>=1 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_4x=`awk '$1>=4 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_10x=`awk '$1>=10 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_20x=`awk '$1>=20 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_50x=`awk '$1>=50 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_100x=`awk '$1>=100 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_200x=`awk '$1>=200 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_500x=`awk '$1>=500 {sum += 1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_sum=`awk '$1>0 {sum += $1};END {printf("%0.0f\n",sum)}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		coverage_1x_rate=`echo $coverage_1x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_4x_rate=`echo $coverage_4x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_10x_rate=`echo $coverage_10x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_20x_rate=`echo $coverage_20x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_50x_rate=`echo $coverage_50x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_100x_rate=`echo $coverage_100x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_200x_rate=`echo $coverage_200x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		coverage_500x_rate=`echo $coverage_500x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		average_coverage=$(printf "%d" $((coverage_sum/coverage_bases)))
+		median_coverage=`less Essential/$sample_dir/${i}.${bed}.all.depth|wc -l | xargs -i expr {} / 2 + 1 | xargs -i sed -n {}p Essential/$sample_dir/${i}.${bed}.all.depth`
+		Uniformity_x=`awk -v average_coverage=$average_coverage '$1>=(average_coverage*0.25) {sum += 1};END {print sum}' Essential/$sample_dir/${i}.${bed}.all.depth`
+		Uniformity=`echo $Uniformity_x $coverage_bases | awk '{printf("%0.2f%\n",$1*100/$2)}'`
+		Mode_insert_size=`less Essential/$sample_dir/${i}.insert_size_metrics.txt | sed -n 8p | cut -f2`
+		echo -ne "${i}\t${bed}\t$average_coverage\t$Reads_capture_rate\t$Accurate_mapping_rate\t$Uniformity\t$coverage_1x_rate\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq11/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq11/.gz/}.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq11/.gz/}.stat|awk '$0~/Q30\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq11/.gz/}.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq11/.gz/}.stat|awk '$0~/Q20\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq22/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq22/.gz/}.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq22/.gz/}.stat|awk '$0~/Q30\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq22/.gz/}.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${fq22/.gz/}.stat|awk '$0~/Q20\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q30\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q20\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q30\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q20\%:/{split($0,a,":");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.stat|awk '$0~/average length:/{split($0,a,"\t");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.stat|awk '$0~/average quality:/{split($0,a,"\t");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.stat|awk '$0~/insert size average:/{split($0,a,"\t");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$Duplication_rate\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls 
+		echo -ne $Raw_reads"\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne $Raw_bases"\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne $Clean_reads"\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne $Clean_bases"\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.stat|awk '$0~/bases mapped \(cigar\):/{split($0,a,"\t");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		cat Essential/$sample_dir/${i}.ontarget.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]"\t"}' >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$Target_effective_bases\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$Bases_capture_rate\t" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$coverage_1x_rate\t$coverage_4x_rate\t$coverage_10x_rate\t$coverage_20x_rate\t$coverage_50x_rate\t$coverage_100x_rate\t$coverage_200x_rate\t$coverage_500x_rate\t$median_coverage\t$Mode_insert_size\n" >>Essential/$sample_dir/${i}.Sequencing.QC.xls
+		mv Essential/$sample_dir/${i}.ready.ba* bam/
+		rm Essential/$sample_dir/${i}.${bed}.all.depth Essential/$sample_dir/${i}.${bed}.depth
+		rm Essential/$sample_dir/$fq22 Essential/$sample_dir/$fq11 Essential/$sample_dir/${fq11/.gz/} Essential/$sample_dir/${fq22/.gz/}
+}
+#####################
+#arguments
+#####################
+cd `pwd`
+echo Work started at `date`
+[ $# -eq 0 ] && echo_usage $bin_dir
+while getopts "f:i:p:thv" arg
+do
+    case $arg in
+	     f)
+		config=$OPTARG
+		config=$(readlink -f $config)
+		;;
+	     i)
+		inputF=$OPTARG
+		inputF=$(readlink -f $inputF)
+		if [ "$inputF" == "" -o ! -e "$inputF" ];then
+			echo Cannot find sequencing data file.
+			exit 1
+		fi
+		;;
+	      o)
+		outputF=$OPTARG
+		outputF=$(readlink -f $outputF)
+		if [ "$outputF" == "" -o ! -e "$outputF" ];then
+			echo Cannot find output path.
+			exit 1
+		fi
+		;;
+	      t)
+		[ -f $bin_dir/Somatic_configure.csv ]&& cp $bin_dir/Somatic_configure.csv . && echo Produce file Somatic_configure.csv
+		exit 0
+		;;
+	      h)
+		echo_usage $bin_dir
+		exit 0
+		;;
+        ?)
+		echo "unknow argument"
+		echo_usage $bin_dir
+		exit 0
+		;;
+        esac
+done
+###############################################################
+#configure & Somatic Analysis
+###############################################################
+#Sample information
+#Barcode,Target
+mkdir .log
+declare -A sample_target
+config2=${config}.txt
+dos2unix $config
+###############################################################
+# preparing essential folder and files
+###############################################################
+mkdir bam resource cnvkit_PoN GATK_cnv_PoN
+touch bam/None.ready.bam
+mkdir -p PoN/tmp
+#format: from csv to txt
+awk 'BEGIN{FS=",";OFS="\t"}{print $1,$2,$3,$4}' $config >$config2
+sample_barcode=(`cut -f1 $config2|sort -u`) #label infact
+sample_num=`cut -f1 $config2|sort -u|wc -l`
+k=0
+while read line;do 
+	Ncol=`echo $line|wc -w`
+	temparray=($line);
+	if [ $Ncol -eq 4 ];then
+		if [ ! -e $target_dir/${temparray[3]} ];then
+		echo "ERROR: Can not find ${temparray[3]} in panel databases."
+		exit
+		fi
+		if [ $k -lt 1 ];then
+			Tumor_Essential_Analysis ${temparray[1]} ${temparray[3]}
+			Tumor_Essential_Analysis ${temparray[2]} ${temparray[3]}
+		fi
+		k=`expr $k + 1`
+		if [ $k -gt 1 ];then
+			wait
+			k=0
+			Tumor_Essential_Analysis ${temparray[1]} ${temparray[3]}
+			Tumor_Essential_Analysis ${temparray[2]} ${temparray[3]}
+			k=`expr $k + 1`
+		fi
+	else
+		echo ERROR: Line \"$line\" in file \"$config \" is not 4 columns.
+		exit
+	fi
+done <$config2
+wait

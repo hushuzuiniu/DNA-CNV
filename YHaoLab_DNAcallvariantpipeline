@@ -1,0 +1,461 @@
+#!/bin/bash
+set +x
+#init
+######################
+software=/yqyuhao
+Ncpu=$(lscpu|awk '/^CPU\(s\)/{print int($2)}')
+bin_dir=$software/bin
+target_dir=$software/target
+database_dir=$software/database
+annovar_dir=$database_dir/Annovar_hg19
+GATK_dir=$database_dir/GATK_hg19
+ref=$GATK_dir/ucsc.hg19.fasta
+PWD=`pwd`
+echo Analysis_Path=$PWD
+export PATH=$bin_dir:$PATH
+#####Programs Usage################
+function echo_usage()
+{
+cat<<END
+Usage:
+YHaoLab_DNAcallvariantpipeline -f Somatic_configure.csv -i /DATA/fastq_directory
+	Input:
+		-f Somatic_configure.csv    Somatic Configure File
+		-i /DATA/fastq_directory    a directory of fastq files.
+	
+	ConfigFile Format:
+	SampleName           Tumor_Name      Normal_Name     Target_Region
+        Tumor1_Somatic       Tumor1          Normal1         Target1.bed
+        Tumor2_Somatic       Tumor2          Normal2         Target2.bed
+        Tumor3_Somatic       Tumor3          Normal3         Target3.bed
+	
+	Help:
+		-t                          Produce a templete of configure.csv file.
+		-h                          Show this help.
+        
+	Please check Sample Number ( less than $Ncpu Samples )
+    
+	Analysis Programs Created by yqyuhao  v2022-01-21
+END
+echo -e "\nTarget list:"
+for i in $target_dir/*.bed;do echo -e "\t`basename $i`";done
+exit 1
+}
+# function TumorOnly Somatic Negative Analysis
+function TumorOnly_Somatic_PoN()
+{
+    x=$1
+    y=$2
+    z=$3
+    r=$4
+    echo SampleName=$x
+    echo Tumor=$y
+    echo Nomal=$z
+    echo BED=$r
+	mkdir -p PoN/$z
+	# ******************************************
+	#  Tumor-only Negative Mutation Calling
+	# ******************************************
+	$bin_dir/gatk --java-options "-Xmx4g" Mutect2 \
+	-R $ref \
+	-I bam/$z.ready.bam \
+	-L $target_dir/$r \
+	--max-mnp-distance 0 \
+	-O PoN/$z/$z.vcf.gz >.log/$z.TumorOnly_Somatic_PoN.log 2>&1
+}
+# function TumorOnly CNVkit Negative Analysis
+function TumorOnly_cnvkit_PoN()
+{
+    x=$1
+	y=$2
+	z=$3
+	r=$4
+	echo SampleName=$x
+	echo Tumor=$y
+	echo Nomal=$z
+	echo BED=$r
+	# ******************************************
+	#  Tumor-only Negative Copy Number Variant
+	# ******************************************
+	python3 $bin_dir/cnvkit.py coverage bam/$z.ready.bam $target_dir/${r/.bed/}.cnvkit.bed -o cnvkit_PoN/$z.raw.targetcoverage.cnn
+    python3 $bin_dir/cnvkit.py coverage bam/$z.ready.bam $target_dir/${r/.bed/}.anti.cnvkit.bed -o cnvkit_PoN/$z.raw.antitargetcoverage.cnn
+}
+# function TumorOnly GATKcnv Negative Analysis
+function TummorOnly_GATKcnv_PoN()
+{
+		x=$1
+		y=$2
+		z=$3
+		r=$4
+		echo SampleName=$x
+		echo Tumor=$y
+		echo Nomal=$z
+		echo BED=$r
+		$bin_dir/gatk --java-options "-Xmx4g" CollectReadCounts \
+		--format HDF5 \
+		--intervals $target_dir/$r \
+		--interval-merging-rule OVERLAPPING_ONLY \
+		-I bam/$z.ready.bam \
+		-R $ref \
+		-O GATK_cnv_PoN/$z.counts.HDF5 >.log/$z.TummorOnly_GATKcnv_PoN.log 2>&1
+}
+# function TumorOnly Somatic Analysis
+function TumorOnly_Somatic_Analysis()
+{
+    x=$1
+    y=$2
+    z=$3
+    r=$4
+    echo SampleName=$x
+    echo Tumor=$y
+    echo Nomal=$z
+    echo BED=$r
+	sample_dir_TumorOnly=${x}.Tumor_only
+	mkdir $sample_dir_TumorOnly
+
+	# ******************************************
+	#  Tumor-only Variant Calling
+	# ******************************************	
+	$bin_dir/gatk --java-options "-Xmx4g" Mutect2 \
+	-R $ref \
+	-I bam/$y.ready.bam \
+	-tumor $y \
+	-pon resource/SomaticPanelOfNormals_pon_db.vcf.gz \
+	--germline-resource $GATK_dir/somatic-b37_af-only-gnomad.raw.sites.vcf \
+	--af-of-alleles-not-in-resource 0.0000025 \
+	--disable-read-filter MateOnSameContigOrNoMappedMateReadFilter \
+	--f1r2-tar-gz $sample_dir_TumorOnly/$y.f1r2.tar.gz \
+	-L $target_dir/$r \
+	-O $sample_dir_TumorOnly/$y.TumorOnly_mutect2.vcf.gz >.log/$sample_dir_TumorOnly.TumorOnly_Somatic_Analysis.log 2>&1
+
+	$bin_dir/gatk --java-options "-Xmx4g" LearnReadOrientationModel \
+	-I $sample_dir_TumorOnly/$y.f1r2.tar.gz \
+	-O $sample_dir_TumorOnly/$y.read-orientation-model.tar.gz >>.log/$sample_dir_TumorOnly.TumorOnly_Somatic_Analysis.log 2>&1
+		
+	$bin_dir/gatk --java-options "-Xmx4g" GetPileupSummaries \
+	-I bam/$y.ready.bam \
+	-L $target_dir/$r \
+	-V $GATK_dir/somatic-b37_small_exac_common_3.vcf \
+	-O $sample_dir_TumorOnly/$y.getpileupsummaries.table >>.log/$sample_dir_TumorOnly.TumorOnly_Somatic_Analysis.log 2>&1
+		
+	$bin_dir/gatk --java-options "-Xmx4g" CalculateContamination \
+	-I $sample_dir_TumorOnly/$y.getpileupsummaries.table \
+	-tumor-segmentation $sample_dir_TumorOnly/$y.segments.table \
+	-O $sample_dir_TumorOnly/$y.calculatecontamination.table >>.log/$sample_dir_TumorOnly.TumorOnly_Somatic_Analysis.log 2>&1
+		
+	$bin_dir/gatk --java-options "-Xmx4g" FilterMutectCalls \
+	-R $ref \
+	-V $sample_dir_TumorOnly/$y.TumorOnly_mutect2.vcf.gz \
+	--contamination-table $sample_dir_TumorOnly/$y.calculatecontamination.table \
+	--ob-priors $sample_dir_TumorOnly/$y.read-orientation-model.tar.gz \
+	-O $sample_dir_TumorOnly/$y.TumorOnly_filtered.vcf.gz >>.log/$sample_dir_TumorOnly.TumorOnly_Somatic_Analysis.log 2>&1
+		
+	# Raw FilterMutectCalls 
+	perl $bin_dir/table_annovar.pl $sample_dir_TumorOnly/$y.TumorOnly_filtered.vcf.gz $annovar_dir -buildver hg19 -out $sample_dir_TumorOnly/$y.TumorOnly_filtered -remove -protocol refGene,cytoBand,genomicSuperDups,avsnp150,cosmic89,clinvar_20190305,ljb26_all,exac03,1000g2015aug_all -operation g,r,r,f,f,f,f,f,f -nastring . -vcfinput
+	echo -ne "Chr\tStart\tEnd\tRef\tAlt\tFunc.refGene\tGene.refGene\tExonicFunc.refGene\tAAChange.refGene\tcytoBand\tgenomicSuperDups\tavsnp150\tcosmic89\tCLINSIG\tCLNDBN\tCLNACC\tCLNDSDB\tCLNDSDBID\tSIFT_score\tSIFT_pred\tPolyphen2_HDIV_score\tPolyphen2_HDIV_pred\tPolyphen2_HVAR_score\tPolyphen2_HVAR_pred\tLRT_score\tLRT_pred\tMutationTaster_score\tMutationTaster_pred\tMutationAssessor_score\tMutationAssessor_pred\tFATHMM_score\tFATHMM_pred\tRadialSVM_score\tRadialSVM_pred\tLR_score\tLR_pred\tVEST3_score\tCADD_raw\tCADD_phred\tGERP++_RS\tphyloP46way_placental\tphyloP100way_vertebrate\tSiPhy_29way_logOdds\tExAC_ALL\tExAC_AFR\tExAC_AMR\tExAC_EAS\tExAC_FIN\tExAC_NFE\tExAC_OTH\tExAC_SAS\t1000g2015aug_all\tDepth\tMutationRate\n" >$sample_dir_TumorOnly/$y.TumorOnly_filtered.hg19_multianno.database
+	cat $sample_dir_TumorOnly/$y.TumorOnly_filtered.hg19_multianno.txt|awk 'BEGIN{FS="\t"}{if($0!~/unknown/ && ($63 == "PASS" || $63 ~/germline/) && ($45 <= 0.01||$45 == ".") && ($48 <= 0.01 || $48 == ".") && $6=="exonic"){split($66,a,":");TumorDepth=a[4];TumorRatio=a[3];print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$9"\t"$10"\t"$11"\t"$12"\t"$13"\t"$14"\t"$15"\t"$16"\t"$17"\t"$18"\t"$19"\t"$20"\t"$21"\t"$22"\t"$23"\t"$24"\t"$25"\t"$26"\t"$27"\t"$28"\t"$29"\t"$30"\t"$31"\t"$32"\t"$33"\t"$34"\t"$35"\t"$36"\t"$37"\t"$38"\t"$39"\t"$40"\t"$41"\t"$42"\t"$43"\t"$44"\t"$45"\t"$46"\t"$47"\t"$48"\t"$49"\t"$50"\t"$51"\t"$52"\t"$53"\t"TumorDepth"\t"TumorRatio"\t"$63}}' >>$sample_dir_TumorOnly/$y.TumorOnly_filtered.hg19_multianno.database
+		
+	$bin_dir/gatk --java-options "-Xmx4g" Funcotator \
+	-R $ref \
+	-V $sample_dir_TumorOnly/$y.TumorOnly_filtered.vcf.gz \
+	-O $sample_dir_TumorOnly/$y.TumorOnly_filtered.funcotator.somatic.maf \
+	--output-file-format MAF \
+	--data-sources-path $database_dir/funcotator_annovar/funcotator_dataSources.v1.7.20200521s/ \
+	--ref-version hg19 >>.log/$sample_dir_TumorOnly.TumorOnly_Somatic_Analysis.log 2>&1
+		
+	cat $sample_dir_TumorOnly/$y.TumorOnly_filtered.funcotator.somatic.maf |awk 'BEGIN{FS="\t";OFS="\t"}{print $5,$6,$1,$16,$11,$13,$9,$10}'|grep -v "#"|sed 's/__UNKNOWN__/'"$y"'/g' >$sample_dir_TumorOnly/$y.TumorOnly_filtered.funcotator.somatic.mutsig2cv.maf
+		
+	# PASS FilterMutectCalls
+	zcat $sample_dir_TumorOnly/$y.TumorOnly_filtered.vcf.gz|perl -alne '{if(/^#/){print}else{next unless $F[6] eq "PASS";next if $F[0] =~/_/;print } }' >$sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.vcf
+	zcat $sample_dir_TumorOnly/$y.TumorOnly_filtered.vcf.gz|perl -alne '{if(/^#/){print}else{next unless $F[6]=~m/germline/;next if $F[0] =~/_/;print } }' >>$sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.vcf
+
+	perl $bin_dir/table_annovar.pl $sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.vcf $annovar_dir -buildver hg19 -out $sample_dir_TumorOnly/$y.TumorOnly_filtered_pass -remove -protocol refGene,cytoBand,genomicSuperDups,avsnp150,cosmic89,clinvar_20190305,ljb26_all,exac03,1000g2015aug_all -operation g,r,r,f,f,f,f,f,f -nastring . -vcfinput
+	echo -ne "Chr\tStart\tEnd\tRef\tAlt\tFunc.refGene\tGene.refGene\tExonicFunc.refGene\tAAChange.refGene\tcytoBand\tgenomicSuperDups\tavsnp150\tcosmic89\tCLINSIG\tCLNDBN\tCLNACC\tCLNDSDB\tCLNDSDBID\tSIFT_score\tSIFT_pred\tPolyphen2_HDIV_score\tPolyphen2_HDIV_pred\tPolyphen2_HVAR_score\tPolyphen2_HVAR_pred\tLRT_score\tLRT_pred\tMutationTaster_score\tMutationTaster_pred\tMutationAssessor_score\tMutationAssessor_pred\tFATHMM_score\tFATHMM_pred\tRadialSVM_score\tRadialSVM_pred\tLR_score\tLR_pred\tVEST3_score\tCADD_raw\tCADD_phred\tGERP++_RS\tphyloP46way_placental\tphyloP100way_vertebrate\tSiPhy_29way_logOdds\tExAC_ALL\tExAC_AFR\tExAC_AMR\tExAC_EAS\tExAC_FIN\tExAC_NFE\tExAC_OTH\tExAC_SAS\t1000g2015aug_all\tDepth\tMutationRate\n" >$sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.hg19_multianno.database
+	cat $sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.hg19_multianno.txt|awk 'BEGIN{FS="\t"}{if($0!~/unknown/ && ($63 == "PASS") && ($45 <= 0.01||$45 == ".") && ($48 <= 0.01 || $48 == ".") && ($53 <= 0.01 || $53 == ".") && $6=="exonic"){split($66,a,":");TumorDepth=a[4];TumorRatio=a[3];print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$9"\t"$10"\t"$11"\t"$12"\t"$13"\t"$14"\t"$15"\t"$16"\t"$17"\t"$18"\t"$19"\t"$20"\t"$21"\t"$22"\t"$23"\t"$24"\t"$25"\t"$26"\t"$27"\t"$28"\t"$29"\t"$30"\t"$31"\t"$32"\t"$33"\t"$34"\t"$35"\t"$36"\t"$37"\t"$38"\t"$39"\t"$40"\t"$41"\t"$42"\t"$43"\t"$44"\t"$45"\t"$46"\t"$47"\t"$48"\t"$49"\t"$50"\t"$51"\t"$52"\t"$53"\t"TumorDepth"\t"TumorRatio"\t"$63}}' >>$sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.hg19_multianno.database
+		
+	$bin_dir/gatk --java-options "-Xmx4g" Funcotator \
+	-R $ref \
+	-V $sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.vcf \
+	-O $sample_dir_TumorOnly/$y.TumorOnly_filtered_pass.funcotator.somatic.maf \
+	--output-file-format MAF \
+	--data-sources-path $database_dir/funcotator_annovar/funcotator_dataSources.v1.7.20200521s/ \
+	--ref-version hg19 >>.log/$sample_dir_TumorOnly.TumorOnly_Somatic_Analysis.log 2>&1
+	echo "$x Somatic Work finished at `date`"
+}
+# function TumorOnly CNVkit Analysis
+function TumorOnly_cnvkit_Analysis()
+{
+    x=$1
+	y=$2
+	z=$3
+	r=$4
+	echo SampleName=$x
+	echo Tumor=$y
+	echo Nomal=$z
+	echo BED=$r
+	sample_dir_TumorOnly=${x}.cnvkit.Tumor_only
+	mkdir $sample_dir_TumorOnly
+	# ******************************************
+	#  Tumor-only Copy Number Variant
+	# ******************************************
+    python3 $bin_dir/cnvkit.py batch \
+    bam/$y.ready.bam \
+    --normal bam/Normal_bam/*.ready.bam \
+    --targets $target_dir/${r/.bed/}.cnvkit.bed \
+    --annotate $target_dir/refFlat.txt \
+    --fasta $ref \
+    --access $target_dir/ucsc.hg19.bed \
+    --output-reference $sample_dir_TumorOnly/${r/.bed/}.cnvkit_reference.cnn \
+    --output-dir $sample_dir_TumorOnly/output \
+    --diagram --scatter
+    ploidy=`cat $x.GATKcnv.Tumor_only/$y.ABSOLUTE.purity_ploidy.xls |sed -n "2p"|awk 'BEGIN{FS="\t"}{printf("%0.0f\n",$3)}'`
+    purity=`cat $x.GATKcnv.Tumor_only/$y.ABSOLUTE.purity_ploidy.xls |sed -n "2p"|awk 'BEGIN{FS="\t"}{printf("%0.2f\n",$2)}'`
+    python3 $bin_dir/cnvkit.py coverage bam/$y.ready.bam $target_dir/${r/.bed/}.cnvkit.bed -o $sample_dir_TumorOnly/$y.raw.targetcoverage.cnn
+    python3 $bin_dir/cnvkit.py coverage bam/$y.ready.bam $target_dir/${r/.bed/}.anti.cnvkit.bed -o $sample_dir_TumorOnly/$y.raw.antitargetcoverage.cnn
+    wait
+    cat $sample_dir_TumorOnly/$y.raw.targetcoverage.cnn|uniq >$sample_dir_TumorOnly/$y.targetcoverage.cnn
+    cat $sample_dir_TumorOnly/$y.raw.antitargetcoverage.cnn|uniq >$sample_dir_TumorOnly/$y.antitargetcoverage.cnn
+    python3 $bin_dir/cnvkit.py fix $sample_dir_TumorOnly/$y.targetcoverage.cnn $sample_dir_TumorOnly/$y.antitargetcoverage.cnn resource/CNVkit.reference.cnn -o $sample_dir_TumorOnly/$y.cnr
+    cat $sample_dir_TumorOnly/$y.cnr |grep -v "chrY"|grep -v "chrM"|awk 'BEGIN{FS="\t";OFS="\t"}{if($1!~/\_/){print $0}}' >$sample_dir_TumorOnly/$y.trim.cnr
+    python3 $bin_dir/cnvkit.py segment $sample_dir_TumorOnly/$y.trim.cnr -o $sample_dir_TumorOnly/$y.cns
+    python3 $bin_dir/cnvkit.py call $sample_dir_TumorOnly/$y.cns --ploidy $ploidy --purity $purity -o $sample_dir_TumorOnly/$y.call.cns
+    python3 $bin_dir/cnvkit.py scatter $sample_dir_TumorOnly/$y.trim.cnr -s $sample_dir_TumorOnly/$y.call.cns -o $sample_dir_TumorOnly/$y.cnv.scatter.pdf
+    python3 $bin_dir/cnvkit.py diagram $sample_dir_TumorOnly/$y.trim.cnr -s $sample_dir_TumorOnly/$y.call.cns -o $sample_dir_TumorOnly/$y.cnv.diagram.pdf
+}
+# function TumorOnly GATK CNV Analysis
+function TummorOnly_GATKcnv_Analysis()
+{
+	x=$1
+	y=$2
+	z=$3
+	r=$4
+	echo SampleName=$x
+	echo Tumor=$y
+	echo Nomal=$z
+	echo BED=$r
+	sample_dir_TumorOnly=${x}.GATKcnv.Tumor_only
+	mkdir $sample_dir_TumorOnly
+	# ******************************************
+	#  CNV TumorOnly Calling
+	# ******************************************
+	$bin_dir/gatk CollectReadCounts \
+	--intervals $target_dir/$r -R $ref -I bam/$y.ready.bam \
+	--format HDF5 --interval-merging-rule OVERLAPPING_ONLY \
+	-O $sample_dir_TumorOnly/$y.HDF5 >.log/$sample_dir_TumorOnly.TummorOnly_GATKcnv_Analysis.log 2>&1
+	
+	$bin_dir/gatk CollectAllelicCounts \
+	-R $ref -I bam/$y.ready.bam \
+	-O $sample_dir_TumorOnly/$y.AllelicCounts.tsv --intervals $target_dir/$r >>.log/$sample_dir_TumorOnly.TummorOnly_GATKcnv_Analysis.log 2>&1
+	
+	$bin_dir/gatk DenoiseReadCounts \
+	-I $sample_dir_TumorOnly/$y.HDF5 \
+	--count-panel-of-normals resource/CNVPanelOfNormals.HDF5 \
+	--standardized-copy-ratios $sample_dir_TumorOnly/$y.standard.tsv \
+	--denoised-copy-ratios $sample_dir_TumorOnly/$y.Denoised.tsv >>.log/$sample_dir_TumorOnly.TummorOnly_GATKcnv_Analysis.log 2>&1
+	
+	$bin_dir/gatk ModelSegments \
+	--denoised-copy-ratios $sample_dir_TumorOnly/$y.Denoised.tsv \
+	--allelic-counts $sample_dir_TumorOnly/$y.AllelicCounts.tsv \
+	-O $sample_dir_TumorOnly --output-prefix $y >>.log/$sample_dir_TumorOnly.TummorOnly_GATKcnv_Analysis.log 2>&1
+	
+	$bin_dir/gatk CallCopyRatioSegments \
+	-I $sample_dir_TumorOnly/$y.cr.seg -O $sample_dir_TumorOnly/$y.called.seg >>.log/$sample_dir_TumorOnly.TummorOnly_GATKcnv_Analysis.log 2>&1
+
+	cat $sample_dir_TumorOnly/$y.called.igv.seg |grep -v "chrY"|awk 'BEGIN{FS="\t";OFS="\t"}{if($2!~/\_/){print $0}}' >$sample_dir_TumorOnly/$y.called.absolute.seg
+	Rscript $bin_dir/ABSOLUTE.r $sample_dir_TumorOnly $y
+}
+#####################
+#arguments
+#####################
+cd `pwd`
+echo Work started at `date`
+[ $# -eq 0 ] && echo_usage $bin_dir
+while getopts "f:i:p:thv" arg
+do
+    case $arg in
+	     f)
+		config=$OPTARG
+		config=$(readlink -f $config)
+		;;
+	     i)
+		inputF=$OPTARG
+		inputF=$(readlink -f $inputF)
+		if [ "$inputF" == "" -o ! -e "$inputF" ];then
+			echo Cannot find sequencing data file.
+			exit 1
+		fi
+		;;
+	      o)
+		outputF=$OPTARG
+		outputF=$(readlink -f $outputF)
+		if [ "$outputF" == "" -o ! -e "$outputF" ];then
+			echo Cannot find output path.
+			exit 1
+		fi
+		;;
+	      t)
+		[ -f $bin_dir/Somatic_configure.csv ]&& cp $bin_dir/Somatic_configure.csv . && echo Produce file Somatic_configure.csv
+		exit 0
+		;;
+	      h)
+		echo_usage $bin_dir
+		exit 0
+		;;
+        ?)
+		echo "unknow argument"
+		echo_usage $bin_dir
+		exit 0
+		;;
+        esac
+done
+###############################################################
+#configure & Somatic Analysis
+###############################################################
+#Sample information
+#Barcode,Target
+mkdir .log
+declare -A sample_target
+config2=${config}.txt
+dos2unix $config
+###############################################################
+# preparing essential folder and files
+###############################################################
+mkdir bam resource cnvkit_PoN GATK_cnv_PoN
+touch bam/None.ready.bam
+mkdir -p PoN/tmp
+#format: from csv to txt
+awk 'BEGIN{FS=",";OFS="\t"}{print $1,$2,$3,$4}' $config >$config2
+sample_barcode=(`cut -f1 $config2|sort -u`) #label infact
+sample_num=`cut -f1 $config2|sort -u|wc -l`
+Ncpu=4
+k=0
+while read line;do 
+	Ncol=`echo $line|wc -w`
+	temparray=($line);
+	if [ $Ncol -eq 4 ];then
+	        if [ ! -e $target_dir/${temparray[3]} ];then
+	        echo "ERROR: Can not find ${temparray[3]} in panel databases."
+	        exit
+	        fi
+	        if [ ! -e bam/${temparray[1]}.ready.bam ];then
+	        echo "ERROR: Can not find bam/${temparray[1]}.ready.bam in current directory."
+	        exit
+	        fi
+	        if [ ! -e bam/${temparray[2]}.ready.bam ];then
+	        echo "ERROR: Can not find bam/${temparray[2]}.ready.bam in current directory."
+	        exit
+	        fi
+		if [ $k -lt 4 ];then
+			echo "1"
+			TumorOnly_Somatic_PoN ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			TummorOnly_GATKcnv_PoN ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			TumorOnly_cnvkit_PoN ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+		fi
+		k=`expr $k + 1`
+		if [ $k -gt 4 ];then
+			wait
+			k=0
+			TumorOnly_Somatic_PoN ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			TummorOnly_GATKcnv_PoN ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			TumorOnly_cnvkit_PoN ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			k=`expr $k + 1`
+		fi
+	else
+		echo ERROR: Line \"$line\" in file \"$config \" is not 4 columns.
+		exit
+	fi
+done <$config2
+wait
+###############################################################
+# GATK cnv Normal database
+###############################################################
+$bin_dir/gatk --java-options "-Xmx4g"  CreateReadCountPanelOfNormals \
+	`cat $config|cut -f3 -d','|sort -u|grep -v None|awk '{printf "-I GATK_cnv_PoN/"$0".counts.HDF5 "}'` \
+        -O resource/CNVPanelOfNormals.HDF5
+###############################################################
+# cnvkit cnv Normal database
+###############################################################
+python3 $bin_dir/cnvkit.py reference `cat $config|cut -f3 -d','|sort -u|grep -v None|awk '{printf "cnvkit_PoN/"$0".*coverage.cnn "}'` -f $ref -o resource/CNVkit.reference.cnn
+###############################################################
+# GATK Tumor-Only Normal Mutation database
+###############################################################
+$bin_dir/gatk GenomicsDBImport -R $ref -L chr1 -L chr2 -L chr3 -L chr4 -L chr5 -L chr6 -L chr7 -L chr8 -L chr9 -L chr10 \
+					-L chr11 -L chr12 -L chr13 -L chr14 -L chr15 -L chr16 -L chr17 -L chr18 -L chr19 -L chr20 \
+					-L chr21 -L chr22 -L chrX --genomicsdb-workspace-path PoN/pon_db \
+					`cat $config|cut -f3 -d','|sort -u|grep -v None|awk '{printf "-V PoN/"$0"/"$0".vcf.gz "}'` --tmp-dir PoN/tmp
+cd PoN
+$bin_dir/gatk CreateSomaticPanelOfNormals -R $ref \
+--germline-resource $GATK_dir/somatic-b37_af-only-gnomad.raw.sites.vcf \
+-V gendb://pon_db \
+-O ../resource/SomaticPanelOfNormals_pon_db.vcf.gz
+cd `pwd`
+k=0
+while read line;do 
+	Ncol=`echo $line|wc -w`
+	temparray=($line);
+	if [ $Ncol -eq 4 ];then
+	        if [ ! -e $target_dir/${temparray[3]} ];then
+	        echo "ERROR: Can not find ${temparray[3]} in panel databases."
+	        exit
+	        fi
+	        if [ ! -e bam/${temparray[1]}.ready.bam ];then
+	        echo "ERROR: Can not find bam/${temparray[1]}.ready.bam in current directory."
+	        exit
+	        fi
+	        if [ ! -e bam/${temparray[2]}.ready.bam ];then
+	        echo "ERROR: Can not find bam/${temparray[2]}.ready.bam in current directory."
+	        exit
+	        fi
+		if [ $k -lt 4 ];then
+			echo "1"
+			TumorOnly_Somatic_Analysis ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			TummorOnly_GATKcnv_Analysis ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+		fi
+		k=`expr $k + 1`
+		if [ $k -gt 4 ];then
+			wait
+			k=0
+			TumorOnly_Somatic_Analysis ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			TummorOnly_GATKcnv_Analysis ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			k=`expr $k + 1`
+		fi
+	else
+		echo ERROR: Line \"$line\" in file \"$config \" is not 4 columns.
+		exit
+	fi
+done <$config2
+wait
+k=0
+while read line;do 
+	Ncol=`echo $line|wc -w`
+	temparray=($line);
+	if [ $Ncol -eq 4 ];then
+	        if [ ! -e $target_dir/${temparray[3]} ];then
+	        echo "ERROR: Can not find ${temparray[3]} in panel databases."
+	        exit
+	        fi
+	        if [ ! -e bam/${temparray[1]}.ready.bam ];then
+	        echo "ERROR: Can not find bam/${temparray[1]}.ready.bam in current directory."
+	        exit
+	        fi
+	        if [ ! -e bam/${temparray[2]}.ready.bam ];then
+	        echo "ERROR: Can not find bam/${temparray[2]}.ready.bam in current directory."
+	        exit
+	        fi
+		if [ $k -lt 4 ];then
+			echo "1"
+			TumorOnly_cnvkit_Analysis ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+		fi
+		k=`expr $k + 1`
+		if [ $k -gt 4 ];then
+			wait
+			k=0
+			TumorOnly_cnvkit_Analysis ${temparray[0]} ${temparray[1]} ${temparray[2]} ${temparray[3]} &
+			k=`expr $k + 1`
+		fi
+	else
+		echo ERROR: Line \"$line\" in file \"$config \" is not 4 columns.
+		exit
+	fi
+done <$config2
+wait

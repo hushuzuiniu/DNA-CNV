@@ -1,0 +1,1 @@
+rm -Rf Essential GISTIC_CNV Mutsig2CV PoN resource bam .log *.txt .txt cnvkit_PoN GATK_cnv_PoN *.Tumor_only
